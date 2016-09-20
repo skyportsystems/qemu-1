@@ -136,6 +136,11 @@ class VM(qtest.QEMUQtestMachine):
                                  socket_scm_helper=socket_scm_helper)
         self._num_drives = 0
 
+    def add_device(self, opts):
+        self._args.append('-device')
+        self._args.append(opts)
+        return self
+
     def add_drive_raw(self, opts):
         self._args.append('-drive')
         self._args.append(opts)
