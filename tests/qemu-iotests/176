@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+#
+# Test creating and committing external snapshots with virtio storage
+# devices. Combinations tested:
+# - no guest / guest
+# - virtio-blk / virtio-scsi
+# - no iothread / iothread
+# - single / repeated external snapshot create+commit
+#
+# Failure modes seen with various qemu versions include:
+# - qemu crash due to assertion failure: immediately on start, on
+#   first guest activity, on external snapshot create, on external
+#   snapshot commit, on repeated snapshot create+commit, and on
+#   qmp quit command
+# - qemu hang (no guest activity, qmp blocked): same as above
+# - qemu crash due for other reasons (no assertion, nonzero exit code)
+#
+# The entire test normally takes about 2 minutes to complete.
+# To diagnose failures, re-run with the -d flag to enable printing
+# stdout+stderr from qemu, including guest console output.
+#
+# Copyright (C) 2016 Red Hat, Inc.
+# Copyright (C) 2017 Skyport Systems, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+import os
+import os.path
+import iotests
+import time
+
+base_img = os.path.join(iotests.test_dir, 'base.img')
+new_img = os.path.join(iotests.test_dir, 'new.img')
+
+class BaseSetupNoGuest:
+
+    def setUp(self):
+        self.addCleanup(self.cleanup) # called even if setUp fails
+        iotests.qemu_img('create', '-f', iotests.imgfmt, base_img, '1M')
+        self.vm = iotests.VM(opts=['-nodefaults', '-serial', 'stdio', '-machine', 'accel=kvm'])
+        dev = self.setUpStorage()
+        self.vm.add_drive(base_img, interface='none')
+        self.vm.launch()
+
+    def cleanup(self):
+        self.vm.shutdown(timeout=5)
+        os.remove(base_img)
+        if os.path.isfile(new_img):
+            os.remove(new_img)
+
+class BaseSetupGuest:
+
+    def setUp(self):
+        self.addCleanup(self.cleanup) # called even if setUp fails
+        iotests.qemu_img('create', '-f', iotests.imgfmt, base_img, '100M')
+        self.vm = iotests.VM(opts=['-nodefaults', '-serial', 'stdio', '-machine', 'accel=kvm'])
+        dev = self.setUpStorage()
+        self.vm.add_drive(base_img, interface='none')
+        self.vm.add_kernel(os.path.join(iotests.sample_img_dir, 'linux-buildroot-x86_64.bzImage'))
+        self.vm.add_append('console=ttyS0 rdinit=/bin/sh -c "mount -t devtmpfs devtmpfs /dev; while true; do cat /dev/zero >%s 2>/dev/null; echo -n x; done"' % dev)
+        self.vm.launch()
+        # Wait for guest to start writing to base_img
+        endtime = time.time() + 30
+        while time.time() < endtime:
+            if os.stat(base_img).st_size > 512 * 1024:
+                return
+        self.vm._popen.kill()
+        raise Exception('guest is not writing to %s' % base_img)
+
+    def cleanup(self):
+        self.vm.shutdown(timeout=5)
+        os.remove(base_img)
+        if os.path.isfile(new_img):
+            os.remove(new_img)
+
+class BaseSetupStorageBlk:
+
+    def setUpStorage(self):
+        self.vm.add_device('virtio-blk-pci,drive=drive0')
+        return '/dev/vda'
+
+class BaseSetupStorageBlkIothread:
+
+    def setUpStorage(self):
+        self.vm.add_object('iothread,id=iothread0')
+        self.vm.add_device('virtio-blk-pci,drive=drive0,iothread=iothread0')
+        return '/dev/vda'
+
+class BaseSetupStorageScsi:
+
+    def setUpStorage(self):
+        self.vm.add_device('virtio-scsi-pci,id=scsi0')
+        self.vm.add_device('scsi-hd,drive=drive0,bus=scsi0.0')
+        return '/dev/sda'
+
+class BaseSetupStorageScsiIothread:
+
+    def setUpStorage(self):
+        self.vm.add_object('iothread,id=iothread0')
+        self.vm.add_device('virtio-scsi-pci,id=scsi0,iothread=iothread0')
+        self.vm.add_device('scsi-hd,drive=drive0,bus=scsi0.0')
+        return '/dev/sda'
+
+class BaseTestExtSnapshotCommit:
+
+    def doExtSnapshotCommit(self):
+        result = self.vm.qmp('blockdev-snapshot-sync', device='drive0',
+                             snapshot_file=new_img,
+                             format=iotests.imgfmt,
+                             timeout=5)
+        self.assertIsNotNone(result, 'monitor closed unexpectedly (qemu probably exited)')
+        self.assert_qmp(result, 'return', {})
+
+        result = self.vm.qmp('query-block')
+        self.assertIsNotNone(result, 'monitor closed unexpectedly (qemu probably exited)')
+        self.assert_qmp(result, 'return[0]/inserted/image/filename', new_img)
+        self.assert_qmp(result,
+                        'return[0]/inserted/image/backing-image/filename',
+                        base_img)
+
+        result = self.vm.qmp('block-commit', device='drive0')
+        self.assertIsNotNone(result, 'monitor closed unexpectedly (qemu probably exited)')
+        self.assert_qmp(result, 'return', {})
+
+        self.vm.event_wait(name='BLOCK_JOB_READY')
+
+        result = self.vm.qmp('query-block-jobs')
+        self.assertIsNotNone(result, 'monitor closed unexpectedly (qemu probably exited)')
+        self.assert_qmp(result, 'return[0]/device', 'drive0')
+
+        result = self.vm.qmp('block-job-complete', device='drive0')
+        self.assertIsNotNone(result, 'monitor closed unexpectedly (qemu probably exited)')
+        self.assert_qmp(result, 'return', {})
+
+        self.vm.event_wait(name='BLOCK_JOB_COMPLETED')
+
+    def testExtSnapshotCommit(self):
+        self.doExtSnapshotCommit()
+
+    def testExtSnapshotCommitMulti(self):
+        # Repeating 20 times over 10 seconds seems to trigger
+        # intermittent assertion failures and hangs reliably
+        for i in range(20):
+            time.sleep(0.5)
+            self.doExtSnapshotCommit()
+
+class TestExtSnapshotCommitNoGuestBlk(BaseTestExtSnapshotCommit, BaseSetupNoGuest, BaseSetupStorageBlk, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitNoGuestBlkIothread(BaseTestExtSnapshotCommit, BaseSetupNoGuest, BaseSetupStorageBlkIothread, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitNoGuestScsi(BaseTestExtSnapshotCommit, BaseSetupNoGuest, BaseSetupStorageScsi, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitNoGuestScsiIothread(BaseTestExtSnapshotCommit, BaseSetupNoGuest, BaseSetupStorageScsiIothread, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitGuestBlk(BaseTestExtSnapshotCommit, BaseSetupGuest, BaseSetupStorageBlk, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitGuestBlkIothread(BaseTestExtSnapshotCommit, BaseSetupGuest, BaseSetupStorageBlkIothread, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitGuestScsi(BaseTestExtSnapshotCommit, BaseSetupGuest, BaseSetupStorageScsi, iotests.QMPTestCase):
+    pass
+
+class TestExtSnapshotCommitGuestScsiIothread(BaseTestExtSnapshotCommit, BaseSetupGuest, BaseSetupStorageScsiIothread, iotests.QMPTestCase):
+    pass
+
+if __name__ == '__main__':
+    iotests.main(supported_fmts=["qcow2"])
