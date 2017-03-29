@@ -131,8 +131,10 @@ def log(msg, filters=[]):
 class VM(qtest.QEMUQtestMachine):
     '''A QEMU VM'''
 
-    def __init__(self):
-        super(VM, self).__init__(qemu_prog, qemu_opts, test_dir=test_dir,
+    def __init__(self, opts=None):
+        if opts is None:
+            opts = qemu_opts
+        super(VM, self).__init__(qemu_prog, opts, test_dir=test_dir,
                                  socket_scm_helper=socket_scm_helper)
         self._num_drives = 0
 
@@ -163,6 +165,19 @@ class VM(qtest.QEMUQtestMachine):
         self._args.append(','.join(options))
         self._num_drives += 1
         return self
+
+    def add_object(self, opts):
+        self._args.append('-object')
+        self._args.append(opts)
+        return self
+
+    def add_kernel(self, opts):
+        self._args.append('-kernel')
+        self._args.append(opts)
+
+    def add_append(self, opts):
+        self._args.append('-append')
+        self._args.append(opts)
 
     def pause_drive(self, drive, event=None):
         '''Pause drive r/w operations'''
