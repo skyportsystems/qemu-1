@@ -124,6 +124,8 @@ class QEMUMachine(object):
         try:
             self._pre_launch()
             args = self._wrapper + [self._binary] + self._base_args() + self._args
+            if self._debug:
+                sys.stderr.write('Launching qemu: %s\n' % ' '.join(self._args))
             self._popen = subprocess.Popen(args, stdin=devnull, stdout=qemulog,
                                            stderr=subprocess.STDOUT, shell=False)
             self._post_launch()
@@ -131,13 +133,17 @@ class QEMUMachine(object):
             if self._popen:
                 self._popen.kill()
             self._load_io_log()
+            if self._debug:
+                sys.stderr.write('qemu failed to launch; output:\n')
+                sys.stderr.write(self.get_log())
             self._post_shutdown()
             self._popen = None
-            raise
+            raise Exception('qemu failed to launch (run with -d for output): %s' % sys.exc_info()[0])
 
-    def shutdown(self):
+    def shutdown(self, timeout=60.0):
         '''Terminate the VM and clean up'''
         if not self._popen is None:
+            self._qmp.settimeout(timeout)
             try:
                 self._qmp.cmd('quit')
                 self._qmp.close()
@@ -145,14 +151,17 @@ class QEMUMachine(object):
                 self._popen.kill()
 
             exitcode = self._popen.wait()
-            if exitcode < 0:
-                sys.stderr.write('qemu received signal %i: %s\n' % (-exitcode, ' '.join(self._args)))
             self._load_io_log()
             self._post_shutdown()
             self._popen = None
+            if exitcode != 0:
+                if self._debug:
+                    sys.stderr.write('qemu exited with code %d; output:\n' % exitcode)
+                    sys.stderr.write(self.get_log())
+                raise Exception('qemu exited with code %d (run with -d for output)' % exitcode)
 
     underscore_to_dash = string.maketrans('_', '-')
-    def qmp(self, cmd, conv_keys=True, **args):
+    def qmp(self, cmd, conv_keys=True, timeout=60.0, **args):
         '''Invoke a QMP command and return the result dict'''
         qmp_args = dict()
         for k in args.keys():
@@ -161,6 +170,7 @@ class QEMUMachine(object):
             else:
                 qmp_args[k] = args[k]
 
+        self._qmp.settimeout(timeout)
         return self._qmp.cmd(cmd, args=qmp_args)
 
     def command(self, cmd, conv_keys=True, **args):
